@@ -8,6 +8,7 @@ specs/
 
 # Local documentation
 *.md
+!README.md
 
 # Local inventory
 Grading_Inventory _ GRADE_A.csv
