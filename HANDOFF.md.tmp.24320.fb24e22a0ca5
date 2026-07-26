@@ -1,0 +1,229 @@
+# HANDOFF.md — VAYUNX Chat Application (Grade A)
+
+**Last updated**: 2026-07-22 (Phase 5b complete — username discovery + user directory, FR-052/FR-053, all gates green; infra note: app uses native PostgreSQL 18 on :5432, which shadows the Docker postgres container — see §5)
+
+Read this first if you're picking up this project in a new session. It tells you what exists, why, how to run it, and exactly what's next.
+
+---
+
+## 1. What this project is
+
+VAYUNX is a production-quality, end-to-end encrypted chat application. This folder (`Grade_A`) is the **first of several independent "Grade" folders** that will eventually be duplicated with only the cryptographic implementation swapped. Business features, API contracts, database schema, frontend, and project structure are meant to stay identical across grades — **only the crypto implementation differs** (see `CONSTITUTION.md` Principle X).
+
+Grade A's concrete algorithms: Argon2id (passwords), Ed25519 (JWT signing), ML-DSA-65 (identity keys), ML-KEM-768 (key exchange), HKDF-SHA3-256 (KDF), ChaCha20-Poly1305 (message/file encryption), SHA3-256 (hashing), TLS 1.3 hybrid X25519+ML-KEM-768 (transport). Full rationale in `DECISIONS.md`.
+
+## 2. The governing process (read this before doing anything)
+
+The user is running a strict **23-phase, phase-gated development process** (Phase 0 Requirements Analysis → Phase 23 Project Completion), with an explicit approval gate between every phase — nothing proceeds without the user's go-ahead. This is documented in full in the original project brief (see conversation history / `CONSTITUTION.md` Principle IX).
+
+**Critically**: this 23-phase process was implemented via **Spec Kit** (GitHub's spec-driven development toolkit, installed as Claude Code skills under `.claude/skills/speckit-*`), but the full `/speckit-specify` → `/speckit-plan` → `/speckit-tasks` chain was run **once**, covering the entire application (all 11 user stories, all 51 functional requirements). It is **not** re-run per phase. The single `tasks.md` (140 tasks) is the master implementation backlog for the whole app, mapped onto the user's 23 phases as a documented correspondence (see `docs/phases/phase-02-project-structure-report.md`'s intro, or re-derive from `specs/001-e2ee-chat-platform/tasks.md`'s phase structure).
+
+**Going forward, the workflow per phase is**:
+1. Implement that phase's tasks from `tasks.md` (models → repositories → services → routers, per story).
+2. Actually write and run tests (unit/API/security/crypto-validation as applicable) — never claim "done" without real pass/fail output.
+3. Run `ruff`, `mypy --strict`, `bandit` — all must be clean.
+4. Write a phase report to `docs/phases/phase-NN-<name>-report.md` (Objectives, What Was Built, Testing Report, Decision Log, Risk Report, Known Limitations, Future Recommendations).
+5. **Stop and wait for explicit user approval** before starting the next phase.
+
+No new Spec Kit commands are needed for this loop — only continued implementation. `/speckit-analyze` (read-only, no file writes) can optionally be re-run at any checkpoint as a consistency sanity-check between `spec.md`/`plan.md`/`tasks.md` and what's actually been built; it has been run twice so far and both times found only MEDIUM/LOW issues, all since fixed.
+
+## 3. Where everything lives
+
+```
+Grade_A/
+├── CONSTITUTION.md              # Human-readable governance summary (10 principles)
+├── DECISIONS.md                 # Cryptographic decisions, library choices, key handling
+├── HANDOFF.md                   # This file
+├── .env / .env.example          # .env is local-dev-only, gitignored, real values generated
+├── .gitignore
+├── .specify/memory/constitution.md   # Authoritative constitution for Spec Kit tooling (v1.0.0)
+├── specs/001-e2ee-chat-platform/
+│   ├── spec.md                  # 11 user stories, 53 FRs (FR-001…FR-053), 10 SCs — the single feature spec
+│   ├── plan.md                  # Technical Context, Constitution Check, project structure
+│   ├── research.md              # 15 architectural decisions (Phase 0 of Spec Kit's plan step)
+│   ├── data-model.md            # 14 entities with fields/relationships/validation
+│   ├── contracts/               # rest-api.md, websocket-events.md
+│   ├── quickstart.md            # End-to-end validation guide
+│   ├── tasks.md                 # 148 tasks (132 + 16 remediation), organized by user story
+│   └── checklists/requirements.md
+├── docs/phases/
+│   ├── phase-02-project-structure-report.md   # Setup + Foundational (tasks T001-T031)
+│   ├── phase-03-database-report.md            # Database (tasks T036-T039)
+│   ├── phase-04-authentication-report.md      # Authentication backend (tasks T032-T035, T040-T047)
+│   ├── phase-04-frontend-report.md            # Authentication frontend (T046)
+│   ├── phase-05-messaging-backend-report.md   # US2 messaging backend (T048-T060)
+│   ├── phase-05-messaging-frontend-report.md  # US2 client-side E2EE + UI (T051, T061-T062)
+│   └── phase-05-username-discovery-report.md  # Phase 5b — username handle + user directory (FR-052/FR-053)
+├── backend/                     # FastAPI, layered architecture, see below
+├── frontend/                    # React/TypeScript/Vite, see below
+└── docker/                      # docker-compose.yml, Dockerfiles, reverse-proxy.conf (TLS)
+```
+
+### Backend (`backend/src/`)
+
+```
+api/v1/            # auth.py (register[username]/verify-email/login/logout, rate-limited)
+                    # users.py (publish/rotate identity keys, public-key directory,
+                    #   /users/me profile, /users/search username resolution, /users/{id} summary)
+                    # conversations.py (create/list direct conversations)
+                    # messages.py (send/list ciphertext messages, cursor pagination)
+api/ws/             # connection_manager.py (Redis pub/sub WebSocket fan-out)
+                    # realtime.py (/api/v1/ws — auth-at-upgrade, message.send→message.new)
+core/               # config.py, database.py (commit-on-success + session_scope),
+                     # error_handling.py, redis_client.py, rate_limit.py, dependencies.py
+                     # (auth + messaging DI composition root + get_current_session)
+crypto/              # interfaces.py (7 abstractions) + providers/ (Grade-A concrete
+                     # implementations) + factory.py (the ONE file a future grade swaps)
+models/             # user.py (now with unique indexed `username`), role.py, session.py,
+                     # email_verification_token.py, identity_key.py, conversation.py, message.py (US2)
+repositories/       # base.py, user/session/token/identity_key/conversation/message
+                     # repositories (US2 repos add cursor pagination + rotation;
+                     #   user_repo adds get_by_username/username_exists/search_by_username)
+schemas/            # base.py, auth.py (RegisterRequest.username + username_taken),
+                     # user.py (UserProfileResponse/UserSummaryResponse — no email in summary),
+                     # messaging.py (identity keys, conversations, opaque MessageEnvelope, send/list DTOs)
+services/            # auth_service.py (register takes username), session_service.py, access_tokens.py,
+                     # password_policy.py, errors.py (UsernameAlreadyRegisteredError), audit.py (T047 stub),
+                     # email_service.py (arq enqueue),
+                     # user_service.py (profile/summary/username search), user_errors.py (UserNotFoundError),
+                     # messaging_errors.py, identity_key_service.py (rotation w/
+                     #   attestation verify), conversation_service.py (participant
+                     #   authz), messaging_service.py (opaque send/list)
+workers/            # worker_settings.py (registers send_verification_email), email_jobs.py
+main.py             # FastAPI app, CORS, AuthError + MessagingError handlers, rate
+                     # limiter, auth + users + conversations + messages + realtime routers
+```
+
+Tests mirror this under `backend/tests/{unit,api,security,crypto,performance}/`.
+
+### Frontend (`frontend/src/`)
+
+```
+crypto/interfaces.ts           # Mirrors backend crypto interfaces — client-side E2EE boundary
+crypto/providers/               # @noble/post-quantum (ML-DSA-65/ML-KEM-768),
+                                # @noble/ciphers (ChaCha20-Poly1305), @noble/hashes (HKDF/SHA3)
+crypto/bytes.ts                 # base64 + concatBytes helpers (wire format for ciphertext/keys/sigs)
+crypto/vault.ts                 # LocalIdentity (ML-DSA-65 + ML-KEM-768 keypairs), localStorage persistence,
+                                #   ensureLocalIdentity (idempotent publish of public halves)
+crypto/conversationCrypto.ts    # THE E2EE CORE: establishOutbound/Inbound (ML-KEM-768 + HKDF-SHA3-256),
+                                #   sealMessage/openMessage (ChaCha20-Poly1305 + ML-DSA-65 sign/verify),
+                                #   prepareOutgoing/openIncoming, per-conversation key store
+services/apiClient.ts          # REST + WebSocket client (ciphertext+envelope only, never plaintext)
+                               # + structured ApiError carrying the backend error_code
+services/authService.ts         # register [username] / verifyEmail / login / logout over /api/v1/auth/*
+services/userService.ts         # fetchProfile / getUserSummary / searchUsers over /api/v1/users/* (FR-053)
+services/messagingService.ts   # publishIdentityKey/rotate/list, conversations, send/listMessages
+services/realtimeClient.ts      # WebSocket /api/v1/ws client (auth-at-upgrade, bounded reconnect)
+store/authStore.ts              # zustand+persist session store (access token mirrored to apiClient;
+                                #   loadProfile() pulls /users/me to fill the authoritative username)
+store/messagingStore.ts         # zustand messaging store: identity, conversations, per-conv message logs,
+                                #   sendOutgoing (encrypt+POST), ingestRealtimeMessage (decrypt in-browser);
+                                #   startConversation(username) resolves via /users/search → createConversation
+                                #   (no session copying); peer-username cache for rail/thread labels;
+                                #   plaintext kept only in an in-memory side-cache, never persisted (FR-051)
+hooks/useRealtime.ts            # connects RealtimeClient for session lifetime, wires message.new→store
+types/auth.ts                   # Auth DTOs (username on Register/Auth) + closed AuthErrorCode set + guidance
+types/user.ts                   # UserProfileResponse / UserSummaryResponse (FR-053; summary has no email)
+types/messaging.ts              # US2 DTOs (envelope, identity keys, conversations, messages, WS events)
+components/LatticeField.tsx     # signature: animated ML-KEM key-handshake over a lattice grid
+components/AuthShell.tsx        # two-pane auth surface (thesis panel + form)
+components/Button.tsx, FormField.tsx, RequireAuth.tsx
+pages/Register.tsx, Login.tsx, VerifyEmail.tsx, Conversations.tsx  # Register = Email/Username/Password;
+                                #   Conversations = US2 messaging surface (start-by-username, account chip
+                                #   + rail/thread show usernames)
+styles/global.css               # "cryptographic blueprint" design-token system (+ .conv__* messaging styles)
+main.tsx, App.tsx               # React 18 + react-router v6 (lazy routes, RequireAuth guard; / = Conversations)
+vite.config.ts                  # dev proxy /api + /ws -> backend :8000
+vite-env.d.ts                   # vite/client types for import.meta.env
+```
+
+Design system (loaded via the `frontend-design` skill): a "cryptographic blueprint"
+identity — cool blueprint-paper surface, deep navy ink, a single vermilion
+accent, and the lattice grid (ML-KEM-768 / ML-DSA-65's underlying structure) as
+the signature element. Three typefaces: Space Grotesk (display), Spline Sans
+(body), JetBrains Mono (fingerprints/data). Reduced-motion respected.
+
+## 4. The single most important architectural fact
+
+**Encryption/decryption of message and file content happens exclusively in the browser, never on the backend.** This is spec `FR-051`, not an implementation detail — the backend only ever stores/relays ciphertext + public envelope metadata (algorithm tag, nonce, ephemeral public keys). If you're ever tempted to add a "decrypt on the server" code path, stop — that violates the spec's core guarantee and `SC-002`.
+
+The backend's own `crypto/` module exists for what legitimately belongs server-side: password hashing (Argon2id), JWT signing (Ed25519), and reference implementations of the message/file ciphers used only for crypto validation test vectors — never invoked against real user plaintext by business logic.
+
+## 5. How to run it right now
+
+```powershell
+# Backend (from backend/, requires .env at repo root — already generated for local dev)
+cd backend
+uvicorn src.main:app --reload
+# GET http://127.0.0.1:8000/api/v1/healthz -> {"status":"ok"}  (only endpoint that exists so far)
+
+# Backend tests (requires Postgres + Redis containers up — see below)
+./.venv/Scripts/python.exe -m pytest -q          # 87 passed (59 auth + 10 US2 messaging + 18 username/directory)
+./.venv/Scripts/python.exe -m ruff check src alembic tests
+./.venv/Scripts/python.exe -m mypy --strict src
+./.venv/Scripts/python.exe -m bandit -r src -q
+./.venv/Scripts/python.exe -m black --check src alembic tests
+
+# Frontend (dev server proxies /api and /ws to the backend on :8000)
+cd frontend
+npm run dev      # http://localhost:5173 — Register (Email/Username/Password) / Login / Verify-email / Conversations live
+npm test         # 41 passed (apiClient + authService + authStore + Register + messagingService + conversationCrypto + userService + messagingStore)
+npm run lint     # eslint clean
+npm run build    # tsc -b && vite build — typecheck + production bundle (93 modules)
+
+# Full stack via Docker (Postgres/Redis/MinIO/backend/worker/frontend/TLS proxy)
+docker compose -f docker/docker-compose.yml --env-file .env up -d
+```
+
+**Current infrastructure state**: ⚠️ Read this carefully — there is a **native PostgreSQL 18** installed on the host (`C:\Program Files\PostgreSQL\18`) that listens on `127.0.0.1:5432` and **shadows the Docker `postgres` container**. Because `.env`'s `DATABASE_URL` uses `localhost:5432`, the **backend connects to the native PostgreSQL 18, NOT the Docker container** — all migrations (`0001`, `0002`, `0003_username_baseline`) and data live on the native instance. The Docker `docker-postgres-1` container is mapped to the same port but is unused by the app (its port proxy loses to the native service on `127.0.0.1`). pgAdmin / psql from `C:\Program Files\PostgreSQL\18\` also connect to the native instance.
+
+**Credential sync rule**: the database user the app uses is `vayunx` (db `vayunx`), and its password must match `.env`'s `POSTGRES_PASSWORD` + the password embedded in `DATABASE_URL` (currently `Admin@123`, URL-encoded `Admin%40123`). If you change the `vayunx` password inside PostgreSQL (e.g. via pgAdmin), you MUST also update `.env` — or reset the DB user back to `Admin@123`:
+```sql
+-- run in pgAdmin / native psql, connected to the native PostgreSQL 18 as a superuser:
+ALTER USER vayunx WITH PASSWORD 'Admin@123';
+```
+Editing `POSTGRES_PASSWORD` in `.env` alone does NOT change the running DB's password (it is set once at the DB's init). To change the app's DB password intentionally: `ALTER USER vayunx WITH PASSWORD '<new>';` on the native instance AND update both `POSTGRES_PASSWORD` and `DATABASE_URL` in `.env` (URL-encode special chars: `@`→`%40`).
+
+The `redis` container (`docker-redis-1`) is up — required for rate-limiting + WebSocket pub/sub fan-out tests (no native Redis shadowing). The `mailhog` container (`docker-mailhog-1`) is up (SMTP `:1025`, web inbox `:8025`) — verification emails deliver locally. MinIO has not been started yet (not needed until US4/file sharing). To (re)start the Docker infra: `docker compose -f docker/docker-compose.yml --env-file .env up -d postgres redis mailhog` (note: the `postgres` service here is shadowed by the native PG18 — see above).
+
+## 6. Progress so far
+
+| Phase (user's 23-phase process) | Maps to `tasks.md` | Status |
+|---|---|---|
+| 0. Requirements Analysis | `spec.md` | ✅ Done |
+| 1. Architecture Design | `plan.md`, `research.md`, `data-model.md`, `contracts/` | ✅ Done |
+| 2. Project Structure | Setup + Foundational (T001–T031, +T006a) | ✅ Done — `docs/phases/phase-02-project-structure-report.md` |
+| 3. Database | US1 models/migration/repos (T036–T039) | ✅ Done — `docs/phases/phase-03-database-report.md` |
+| 4. Authentication | US1 services/routers/tests + frontend (T032–T035, T040–T047, T046) | ✅ Done — `docs/phases/phase-04-authentication-report.md` + `docs/phases/phase-04-frontend-report.md` |
+| 5. E2EE 1:1 Messaging (MVP) | US2 backend (T052–T060) | ✅ Done — `docs/phases/phase-05-messaging-backend-report.md` |
+| 5. E2EE 1:1 Messaging (MVP) | US2 frontend (T051, T061, T061a, T062) | ✅ Done — `docs/phases/phase-05-messaging-frontend-report.md` (client-side E2EE + Conversations UI + WS client) |
+| 5b. Username Discovery | US1/US2 remediation (T132a–T132h) — FR-052/FR-053 | ✅ Done — `docs/phases/phase-05-username-discovery-report.md` (username handle + user directory + start-by-username) |
+| 6. Group Messaging | US3 | ⏳ **Next** — awaiting approval |
+| 7–23 | See `tasks.md` phase breakdown | Not started |
+
+> **Phase-numbering note**: the user's 23-phase process and `tasks.md`'s own story-based numbering diverge starting here. In `tasks.md`, US1 is "Phase 3" and US2 is "Phase 4". This table uses the **user's** 23-phase numbering to stay consistent across reports. The next implementation work, regardless of label, is **US3 — group messaging** (Phase 6 in the user's ordering).
+
+## 7. Known open items / risks carried forward
+
+- **TLS 1.3 hybrid (X25519+ML-KEM-768)**: `docker/reverse-proxy.conf` is configured correctly but requires a non-stock nginx/OpenSSL build with the Open Quantum Safe `oqs-provider` — the plain `nginx:1.27-alpine` image does not support this out of the box. Deferred to Phase 16 (Security Hardening); documented in `DECISIONS.md`.
+- **Frontend npm audit**: 5 advisories, all one `esbuild`→`vite`→`vitest` chain (dev-server-only issue, not a production runtime risk). Fixing requires a breaking Vite 5→8 jump, deliberately not forced yet. Tracked for Phase 16.
+- **T046 (frontend auth pages) — DONE**: Register / Login / Verify-email / Home pages wired to the live `/api/v1/auth/*` contract, with the "cryptographic blueprint" design system. See `docs/phases/phase-04-frontend-report.md`. The session store currently persists the refresh token in `localStorage` as a dev convenience — production hardening (HttpOnly refresh cookie, in-memory-only access token, FR-005 rotation) is US10; the store interface is final so that swap is localized.
+- **`TokenRepository`** is currently scoped to `EmailVerificationToken` only; Phase 9 (US7) will decide whether `PasswordResetToken` gets its own repository or extends this one.
+- **Audit logging is a no-op stub** (T047): `AuditLogger` Protocol + `NoOpAuditLogger` are wired into all auth call sites; US11 swaps in the DB-backed `AuditService` without changing call sites.
+- **Mailhog is now in `docker-compose.yml`** (service `mailhog`: SMTP `:1025`, web inbox `:8025`). With it running, the `send_verification_email` arq job delivers a real email — open **http://localhost:8025** to read it and click the verification link, instead of scraping the worker log. Verified end-to-end: register → worker logs `verification_email_sent` (SMTP succeeds) → email appears in the Mailhog inbox with the correct From/To/Subject. The host `.env`'s `SMTP_HOST=localhost:1025` already routes the host-running worker to it; the in-docker `worker` service overrides `SMTP_HOST=mailhog` to reach the container by name. Start it with `docker compose -f docker/docker-compose.yml --env-file .env up -d mailhog`.
+- **Phase 5 (US2) — DONE (backend + frontend)**: identity-key directory (publish/list/rotate with real ML-DSA-65 attestation verification), direct conversations (self-conversation rejected, both participants authorized), opaque message send/list with `(sent_at, id)` cursor pagination, and the `/api/v1/ws` realtime endpoint (auth-at-upgrade, `message.send`→`message.new` fan-out). **Backend** stores/relays ciphertext + envelope verbatim and never parses content (FR-051/SC-002); `integrity_tag_valid_on_receipt` is always False server-side — full authenticity is the client's job (FR-027). **Frontend** does all content crypto in-browser: `conversationCrypto.ts` establishes one ML-KEM-768 shared secret per conversation → HKDF-SHA3-256 → a reused ChaCha20-Poly1305 message key, sealing each message with an ML-DSA-65 signature over `concat(ciphertext, nonce, aad)` (verify-then-decrypt on receipt). A full Double Ratchet is a documented MVP deferral (changes only `conversationCrypto.ts`; server is content-agnostic). The Conversations page is a two-pane thread with realtime ingest; plaintext lives only in an in-memory side-cache, never persisted (FR-051). Tests: backend 69 passed (10 new US2, real liboqs), ruff/mypy --strict(65 files)/black/bandit clean; frontend 30 passed (6 new crypto round-trips with real @noble post-quantum + 8 messagingService), tsc/lint/build clean. See `docs/phases/phase-05-messaging-backend-report.md` + `phase-05-messaging-frontend-report.md`.
+- Every other identified gap from the two `/speckit-analyze` passes has been fixed (see `tasks.md`'s lettered remediation tasks: T006a, T051a, T059a, T059b, T061a, T128a, T128b, T128c).
+- **Phase 5b (Username Discovery) — DONE**: the username is now the unique public identifier. Signup collects Email + Username + Password (FR-052; `display_name` is retained but defaults to the username, editable later via US7). After login the UI shows the logged-in user's username (pulled from `/users/me` via `authStore.loadProfile()` — the JWT still carries only `sub`/`sid`, so this is the correct non-workaround flow). The New Conversation box takes a **username**, resolves it through the authenticated user directory (`GET /users/search` → exact, case-insensitive, rate-limited, **no email**) and starts the direct conversation with the resolved user id via the existing `POST /conversations` — no manual session ids or copying (FR-053). Migration `0003_username_baseline` backfills existing rows from the email local-part. `/users/{id}` returns a public summary (username + display_name, no email); `/users/me` is the only view with email. Gates: backend pytest 87 passed, ruff/mypy --strict(68 files)/bandit/black clean, alembic at 0003; frontend tsc/eslint/vitest 41 passed/build clean. See `docs/phases/phase-05-username-discovery-report.md`.
+- **Dual PostgreSQL on :5432 (environment cleanup, not a code bug)**: a native PostgreSQL 18 on the host shadows the Docker `postgres` container on `127.0.0.1:5432`, so the app talks to the native instance (see "Current infrastructure state" above). This works but is confusing. Recommended cleanup (pick one, not urgent): (a) stop/disable the native PG18 service and use the Docker container exclusively — then run `alembic upgrade head` against the Docker container to (re)create the schema; or (b) keep native PG18 and stop the Docker `postgres` service / remap its host port (e.g. `5433`) so there is a single source of truth. Either way, keep `.env`'s `DATABASE_URL` password in sync with the chosen instance's `vayunx` user.
+
+## 8. Rules that must not be silently relaxed
+
+From `CONSTITUTION.md` / `.specify/memory/constitution.md` — the two that are easiest to accidentally violate mid-implementation:
+
+- **No hardcoded secrets, keys, IVs, salts, or certificates** anywhere in source. Test fixtures use clearly-labeled dev-only generated values (e.g. `backend/tests/fixtures/`), never committed production secrets.
+- **RBAC/authorization must be enforced at the service layer**, not only at the router/middleware layer — relevant starting Phase 4/5.
+
+## 9. If you're a new session picking this up
+
+Read, in order: this file → `CONSTITUTION.md` → `specs/001-e2ee-chat-platform/spec.md` (skim) → `tasks.md` (skim the phase you're about to start) → the most recent `docs/phases/phase-NN-*-report.md`. Then ask the user for explicit approval to start the next phase — do not assume it's already been given.
+

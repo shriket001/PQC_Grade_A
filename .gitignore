@@ -1,0 +1,57 @@
+# ------------------------------------------------------------------------------
+# Project-specific local files
+# ------------------------------------------------------------------------------
+.claude/
+.github/
+.specify/
+specs/
+
+# Local documentation
+*.md
+
+# Local inventory
+Grading_Inventory _ GRADE_A.csv
+
+# Local grading files
+Grading_Application.pdf
+
+# ------------------------------------------------------------------------------
+# Secrets and environment-specific files — never commit real values.
+# ------------------------------------------------------------------------------
+.env
+.env.example
+docker/certs/
+# Local native tool binaries (e.g. the upstream xmlsec1 win64 build pysaml2
+# shells out to — downloaded once, not a pip dependency; lives in .env via
+# SAML_XMLSEC_BINARY_PATH). Public upstream tool, but a multi-MB binary blob
+# has no place in source control.
+tools/
+**/secrets/
+*.pem
+!backend/tests/fixtures/*.pem
+
+# ------------------------------------------------------------------------------
+# Python
+# ------------------------------------------------------------------------------
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# ------------------------------------------------------------------------------
+# Node / Frontend
+# ------------------------------------------------------------------------------
+node_modules/
+dist/
+.vite/
+
+# ------------------------------------------------------------------------------
+# Editors / OS
+# ------------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
