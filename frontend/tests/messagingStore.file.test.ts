@@ -326,4 +326,147 @@ describe("messagingStore.loadFile", () => {
     expect(getDecryptedFile("msg-10")).toBeNull();
     expect(getFileLoadError("msg-10")).not.toBeNull();
   });
+
+  it("does not double-download when loadFile is called concurrently (in-flight guard)", async () => {
+    const me = await meIdentity();
+    const bobSigning = await mlDsa65IdentityKeyProvider.generateKeyPair();
+    useMessagingStore.setState({
+      identity: me,
+      conversations: [directConversation()],
+      activeConversationId: CONV_ID,
+    });
+    const messageKey = crypto.getRandomValues(new Uint8Array(32));
+    conversationKeyStore.set(CONV_ID, { messageKey, peerSigningPublicKey: bobSigning.publicKey });
+
+    const plaintext = packFilePlaintext("image.png", new Uint8Array([10, 20, 30]));
+    const sealed = await sealFile(messageKey, plaintext, bobSigning.privateKey, CONV_ID, "bob-key");
+
+    // Hold the file download open until we release it, so two concurrent
+    // loadFile calls overlap before the first resolves.
+    let releaseDownload: () => void = () => {};
+    const downloadGate = new Promise<void>((resolve) => {
+      releaseDownload = resolve;
+    });
+    let fileFetchCount = 0;
+
+    fetchMock.mockImplementation(async (url: string) => {
+      if (url === `/api/v1/conversations/${CONV_ID}/files/file-11`) {
+        fileFetchCount += 1;
+        await downloadGate;
+        return binaryResponse(200, new Blob([sealed.ciphertext.slice()]), {
+          "X-File-Envelope": JSON.stringify(sealed.envelope),
+          "X-File-Content-Type": "image/png",
+        });
+      }
+      if (url === "/api/v1/users/bob-id/identity-keys") {
+        return jsonResponse(200, [
+          {
+            id: "bob-key",
+            user_id: "bob-id",
+            device_label: "dev",
+            public_signing_key: bytesToBase64(bobSigning.publicKey),
+            public_kem_key: bytesToBase64(new Uint8Array(32)),
+            key_version: 1,
+            created_at: "2030-01-01T00:00:00Z",
+            superseded_at: null,
+          },
+        ]);
+      }
+      return jsonResponse(404, { error_code: "unknown", message: "x" });
+    });
+
+    const message: MessageResponse = {
+      id: "msg-11",
+      conversation_id: CONV_ID,
+      sender_id: "bob-id",
+      sender_identity_key_id: "bob-key",
+      ciphertext: "",
+      envelope: { alg: "aes-256-gcm", nonce: "x", version: 1, kind: "file", file_attachment_id: "file-11" },
+      sent_at: "2030-01-01T00:00:02Z",
+    };
+
+    // Fire two overlapping loads (e.g. prefetch + bubble mount) before the
+    // first has finished — the in-flight guard must collapse them to one fetch.
+    const p1 = useMessagingStore.getState().loadFile(CONV_ID, message);
+    const p2 = useMessagingStore.getState().loadFile(CONV_ID, message);
+    expect(fileFetchCount).toBe(1); // second call returned early, didn't fetch
+
+    releaseDownload();
+    await Promise.all([p1, p2]);
+
+    expect(fileFetchCount).toBe(1);
+    const file = getDecryptedFile("msg-11");
+    expect(file?.filename).toBe("image.png");
+    expect(getFileLoadError("msg-11")).toBeNull();
+  });
+
+  it("retryLoadFile clears a cached failure and re-runs the download", async () => {
+    const me = await meIdentity();
+    const bobSigning = await mlDsa65IdentityKeyProvider.generateKeyPair();
+    useMessagingStore.setState({
+      identity: me,
+      conversations: [directConversation()],
+      activeConversationId: CONV_ID,
+    });
+    const messageKey = crypto.getRandomValues(new Uint8Array(32));
+    conversationKeyStore.set(CONV_ID, { messageKey, peerSigningPublicKey: bobSigning.publicKey });
+
+    const plaintext = packFilePlaintext("report.pdf", new Uint8Array([65, 66, 67]));
+    const sealed = await sealFile(messageKey, plaintext, bobSigning.privateKey, CONV_ID, "bob-key");
+
+    let fileEndpointOk = false;
+    fetchMock.mockImplementation(async (url: string) => {
+      if (url === `/api/v1/conversations/${CONV_ID}/files/file-12`) {
+        if (!fileEndpointOk) {
+          // First attempt: transient server error -> loadFile records an error.
+          return jsonResponse(500, { error_code: "server", message: "boom" });
+        }
+        // Retry attempt: endpoint recovers, returns the sealed bytes.
+        return binaryResponse(200, new Blob([sealed.ciphertext.slice()]), {
+          "X-File-Envelope": JSON.stringify(sealed.envelope),
+          "X-File-Content-Type": "application/pdf",
+        });
+      }
+      if (url === "/api/v1/users/bob-id/identity-keys") {
+        return jsonResponse(200, [
+          {
+            id: "bob-key",
+            user_id: "bob-id",
+            device_label: "dev",
+            public_signing_key: bytesToBase64(bobSigning.publicKey),
+            public_kem_key: bytesToBase64(new Uint8Array(32)),
+            key_version: 1,
+            created_at: "2030-01-01T00:00:00Z",
+            superseded_at: null,
+          },
+        ]);
+      }
+      return jsonResponse(404, { error_code: "unknown", message: "x" });
+    });
+
+    const message: MessageResponse = {
+      id: "msg-12",
+      conversation_id: CONV_ID,
+      sender_id: "bob-id",
+      sender_identity_key_id: "bob-key",
+      ciphertext: "",
+      envelope: { alg: "aes-256-gcm", nonce: "x", version: 1, kind: "file", file_attachment_id: "file-12" },
+      sent_at: "2030-01-01T00:00:02Z",
+    };
+
+    // First load fails -> file not cached, error recorded.
+    await useMessagingStore.getState().loadFile(CONV_ID, message);
+    expect(getDecryptedFile("msg-12")).toBeNull();
+    expect(getFileLoadError("msg-12")).not.toBeNull();
+
+    // A naive loadFile would no-op because the error is cached. retryLoadFile
+    // must clear it and actually re-run now that the endpoint is healthy.
+    fileEndpointOk = true;
+    await useMessagingStore.getState().retryLoadFile(CONV_ID, message);
+
+    expect(getFileLoadError("msg-12")).toBeNull();
+    const file = getDecryptedFile("msg-12");
+    expect(file?.filename).toBe("report.pdf");
+    expect(file?.contentType).toBe("application/pdf");
+  });
 });

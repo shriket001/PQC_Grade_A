@@ -19,6 +19,7 @@ from src.models.conversation import (
     ConversationParticipant,
     ConversationType,
 )
+from src.models.user import User
 from src.repositories.base import BaseRepository
 
 
@@ -94,6 +95,26 @@ class ConversationRepository(BaseRepository[Conversation]):
             .order_by(ConversationParticipant.joined_at.asc())
         )
         return list(result.scalars().all())
+
+    async def list_participants_with_users(
+        self, conversation_id: UUID
+    ) -> list[tuple[ConversationParticipant, str, str]]:
+        """Active participants with their public `username` + `display_name`,
+        joined from the `users` table — same filtering/ordering as
+        `list_participants`. Lets the conversation response carry participant
+        labels directly so the client need not fire a per-peer `GET /users/{id}`
+        to render names (which left a truncated-id flash on refresh)."""
+        stmt = (
+            select(ConversationParticipant, User.username, User.display_name)
+            .join(User, User.id == ConversationParticipant.user_id)
+            .where(
+                ConversationParticipant.conversation_id == conversation_id,
+                ConversationParticipant.left_at.is_(None),
+            )
+            .order_by(ConversationParticipant.joined_at.asc())
+        )
+        result = await self._session.execute(stmt)
+        return [(row[0], row[1], row[2]) for row in result.all()]
 
     async def list_all_participants(self, conversation_id: UUID) -> list[ConversationParticipant]:
         """Every membership row (including left ones). Used on send to reactivate

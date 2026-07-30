@@ -15,8 +15,10 @@ from src.core.dependencies import (
     AuthContext,
     get_conversation_service,
     get_current_session,
+    get_user_repository,
 )
 from src.models.conversation import Conversation, ConversationParticipant
+from src.repositories.user_repository import UserRepository
 from src.schemas.messaging import (
     AddParticipantRequest,
     ConversationParticipantResponse,
@@ -28,16 +30,29 @@ from src.services.conversation_service import ConversationService
 router = APIRouter()
 
 
-def _participant_to_response(p: ConversationParticipant) -> ConversationParticipantResponse:
+def _participant_to_response(
+    p: ConversationParticipant,
+    *,
+    username: str | None = None,
+    display_name: str | None = None,
+) -> ConversationParticipantResponse:
     return ConversationParticipantResponse(
-        user_id=p.user_id, role=p.role.value if p.role is not None else None, joined_at=p.joined_at
+        user_id=p.user_id,
+        role=p.role.value if p.role is not None else None,
+        joined_at=p.joined_at,
+        username=username,
+        display_name=display_name,
     )
 
 
 async def _to_response(
     service: ConversationService, conversation: Conversation
 ) -> ConversationResponse:
-    participants = await service.list_participants(conversation.id)
+    # Joined with the users table so each participant carries its public
+    # username + display_name — the client renders labels immediately instead
+    # of firing a per-peer GET /users/{id} (which flashed a truncated id while
+    # the in-memory name map was empty on refresh).
+    participants = await service.list_participants_with_users(conversation.id)
     return ConversationResponse(
         id=conversation.id,
         type=conversation.type.value,
@@ -45,7 +60,10 @@ async def _to_response(
         created_by=conversation.created_by,
         created_at=conversation.created_at,
         last_message_at=conversation.last_message_at,
-        participants=[_participant_to_response(p) for p in participants],
+        participants=[
+            _participant_to_response(p, username=username, display_name=display_name)
+            for p, username, display_name in participants
+        ],
     )
 
 
@@ -109,6 +127,7 @@ async def add_participant(
     conversation_id: UUID,
     body: AddParticipantRequest,
     service: Annotated[ConversationService, Depends(get_conversation_service)],
+    user_repo: Annotated[UserRepository, Depends(get_user_repository)],
 ) -> ConversationParticipantResponse:
     """Add a member to a group conversation (FR-024, group_admin only).
 
@@ -129,7 +148,15 @@ async def add_participant(
     }
     for p in await service.list_participants(conversation_id):
         await connection_manager.send_to_user(p.user_id, event)
-    return _participant_to_response(participant)
+    # Resolve the new member's public name so the 201 response carries a label
+    # directly (the WS event itself stays id-only; clients re-fetch the
+    # conversation list on membership change, which now includes names).
+    added_user = await user_repo.get_by_id(body.user_id)
+    return _participant_to_response(
+        participant,
+        username=added_user.username if added_user else None,
+        display_name=added_user.display_name if added_user else None,
+    )
 
 
 @router.delete("/conversations/{conversation_id}/participants/{user_id}", status_code=204)

@@ -1404,6 +1404,38 @@ a:hover {
   color: var(--danger-ink);
   font-size: 0.82rem;
 }
+/* Animated loader shown while a message/file is still decrypting (replaces
+ * the static "Decrypting…" placeholder text so an active load reads as
+ * progress, not a stuck state). Reuses the `spin` keyframe from btn__spinner. */
+.bubble__loader {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--line);
+  border-top-color: var(--ink-faint);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  vertical-align: middle;
+}
+/* Neutral (non-red) inline Retry affordance for a file that failed to load —
+ * no raw error string is shown, just a calm label + retry link. */
+.bubble__retry {
+  color: var(--ink-faint);
+  font-size: 0.82rem;
+}
+.bubble__retry-button {
+  margin-left: 0.4em;
+  color: var(--ink-muted);
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.bubble__retry-button:hover {
+  color: var(--ink);
+}
 .bubble__time {
   /* Always visible below the message text — previously hidden until hover/
    * focus, which read as "the time doesn't show". */

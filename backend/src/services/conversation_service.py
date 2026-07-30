@@ -259,6 +259,14 @@ class ConversationService:
     async def list_participants(self, conversation_id: UUID) -> list[ConversationParticipant]:
         return await self._repo.list_participants(conversation_id)
 
+    async def list_participants_with_users(
+        self, conversation_id: UUID
+    ) -> list[tuple[ConversationParticipant, str, str]]:
+        """Active participants joined with their public username + display_name,
+        so the conversation response can carry labels directly (no per-peer
+        `GET /users/{id}` round-trip on the client)."""
+        return await self._repo.list_participants_with_users(conversation_id)
+
     async def authorize_participant(
         self, conversation_id: UUID, user_id: UUID
     ) -> ConversationParticipant:

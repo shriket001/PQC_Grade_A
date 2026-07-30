@@ -172,6 +172,11 @@ interface MessagingState {
    * `decryptedFileCache`/`fileLoadErrors` the UI reads via
    * `getDecryptedFile`/`getFileLoadError`. */
   loadFile: (conversationId: string, message: MessageResponse) => Promise<void>;
+  /** Clear any cached load error for a file message and re-run `loadFile` —
+   * the "Retry" affordance on a failed file bubble. Unlike `loadFile`, it
+   * intentionally bypasses the cached-error early-return so a transient failure
+   * (network blip during download/decrypt) gets a second chance. */
+  retryLoadFile: (conversationId: string, message: MessageResponse) => Promise<void>;
   ingestRealtimeMessage: (data: MessageNewData) => Promise<void>;
   setRealtimeStatus: (status: "disconnected" | "connecting" | "open") => void;
   /** US3 (T068): react to a `conversation.participant_added/removed` WS event
@@ -471,9 +476,17 @@ function otherParticipantUserId(conv: ConversationResponse, selfUserId: string):
 }
 
 /**
- * Resolve peer usernames for the given conversations (best-effort, in parallel)
- * so the rail + thread can render handles instead of truncated ids. Failures are
- * swallowed — the UI falls back to the id prefix.
+ * Resolve peer usernames for the given conversations so the rail, thread, and
+ * group-member panel render handles instead of truncated ids.
+ *
+ * The conversation payload now carries each participant's public `username`
+ * (joined server-side), so we seed the name map directly from it FIRST —
+ * labels render immediately on refresh with no per-peer round-trip, which is
+ * what removed the `e2b0aa5d` truncated-id flash (the in-memory map used to
+ * start empty on every refresh). The per-peer `GET /users/{id}` fetch is kept
+ * only as a backstop for participants still missing a username (an older
+ * server response, or a deleted account). Failures are swallowed — the UI
+ * falls back to a neutral placeholder, never a raw id fragment.
  */
 async function resolvePeerUsernames(
   conversations: ConversationResponse[],
@@ -482,20 +495,37 @@ async function resolvePeerUsernames(
   ) => void,
   get: () => MessagingState,
 ): Promise<void> {
-  const selfUserId = useAuthStore.getState().session?.userId ?? "";
   const cache = get().peerUsernameById;
-  const toResolve = new Set<string>();
+
+  // 1. Seed from the payload — covers 1:1 peers AND every group member (the
+  //    prior version only ever resolved one peer per conversation, so group
+  //    members showed truncated ids).
+  const seeded: Record<string, string> = { ...cache };
   for (const c of conversations) {
-    const peerId = otherParticipantUserId(c, selfUserId);
-    if (peerId && !cache[peerId]) toResolve.add(peerId);
+    for (const p of c.participants) {
+      if (p.username && !seeded[p.user_id]) seeded[p.user_id] = p.username;
+    }
   }
+  if (Object.keys(seeded).length !== Object.keys(cache).length) {
+    set((s) => ({ peerUsernameById: { ...s.peerUsernameById, ...seeded } }));
+  }
+
+  // 2. Backstop: resolve any participant still missing a username via the
+  //    per-peer endpoint (best-effort, parallel).
+  const stillMissing = new Set<string>();
+  for (const c of conversations) {
+    for (const p of c.participants) {
+      if (!seeded[p.user_id]) stillMissing.add(p.user_id);
+    }
+  }
+  if (!stillMissing.size) return;
   await Promise.all(
-    [...toResolve].map(async (peerId) => {
+    [...stillMissing].map(async (peerId) => {
       try {
         const summary = await getUserSummary(peerId);
         set((s) => ({ peerUsernameById: { ...s.peerUsernameById, [peerId]: summary.username } }));
       } catch {
-        // Non-blocking; truncated-id fallback stays in place.
+        // Non-blocking; the neutral placeholder fallback stays in place.
       }
     }),
   );
@@ -726,6 +756,17 @@ export const useMessagingStore = create<MessagingState>((set, get) => ({
       }));
       const identity = get().identity;
       if (identity && conv) {
+        // Prefetch every file/image share in parallel the moment the
+        // conversation opens, rather than waiting for each FileBubble to
+        // mount (lazy load) before its download even starts — large files
+        // would otherwise show a spinner until scrolled into view. Fire-and-
+        // forget; `loadFile`'s in-flight guard dedupes against the FileBubble
+        // mount effect, and any failure is swallowed into the file-error cache
+        // (the bubble shows a neutral Retry, not a scary error).
+        const fileMessages = displayMessages.filter((m) => isFileMessage(m));
+        if (fileMessages.length) {
+          for (const m of fileMessages) void get().loadFile(conversationId, m);
+        }
         // Decrypt the freshly loaded log in-memory (plaintext never persists).
         // The FULL list (including key-distribution records) is processed so
         // every epoch key this device is entitled to gets absorbed. Pre-join
@@ -1298,66 +1339,33 @@ export const useMessagingStore = create<MessagingState>((set, get) => ({
   },
 
   async loadFile(conversationId, message) {
-    if (decryptedFileCache.has(message.id) || fileLoadErrors.has(message.id)) return;
-    const identity = get().identity;
-    const conv = get().conversations.find((c) => c.id === conversationId);
-    const fileAttachmentId = message.envelope.file_attachment_id;
-    if (!identity || !conv || typeof fileAttachmentId !== "string") return;
-
+    // Already resolved, already failed, or already in flight (prefetch may
+    // have started this download on conversation open) — don't double-load.
+    if (
+      decryptedFileCache.has(message.id) ||
+      fileLoadErrors.has(message.id) ||
+      filesLoading.has(message.id)
+    ) {
+      return;
+    }
+    filesLoading.add(message.id);
     try {
-      const { ciphertext, envelope, contentType } = await apiDownloadFile(
-        conversationId,
-        fileAttachmentId,
-      );
-      const senderSigningPublicKey = await fetchSenderSigningKey(
-        message.sender_id,
-        message.sender_identity_key_id,
-      );
+      await downloadAndDecryptFile(conversationId, message, get, set);
+    } finally {
+      filesLoading.delete(message.id);
+    }
+  },
 
-      let filename: string;
-      let bytes: Uint8Array;
-      if (conv.type === "group") {
-        const epoch = envelope.epoch;
-        if (typeof epoch !== "number") throw new Error("group file missing epoch");
-        const key = groupKeyStore.getKey(conversationId, epoch);
-        if (!key) {
-          throw new Error(`no group key for epoch ${epoch} — you may have joined after this file`);
-        }
-        const nonce = base64ToBytes(String(envelope.nonce));
-        const signature = base64ToBytes(String(envelope.sig));
-        const plaintext = await openGroupMessage(
-          key,
-          ciphertext,
-          nonce,
-          signature,
-          senderSigningPublicKey,
-          conversationId,
-          message.sender_identity_key_id,
-          epoch,
-        );
-        ({ filename, bytes } = unpackFilePlaintext(plaintext));
-      } else {
-        const key = await resolveConversationKey(conversationId, identity);
-        if (!key) throw new Error("no key established for this conversation yet");
-        ({ filename, bytes } = await openFile(
-          key.messageKey,
-          ciphertext,
-          envelope,
-          senderSigningPublicKey,
-          conversationId,
-          message.sender_identity_key_id,
-        ));
-      }
-
-      decryptedFileCache.set(message.id, {
-        filename,
-        blob: new Blob([bytes.slice()], { type: contentType }),
-        contentType,
-      });
-      set((s) => ({ fileCacheVersion: s.fileCacheVersion + 1 }));
-    } catch (err) {
-      fileLoadErrors.set(message.id, err instanceof Error ? err.message : "failed to load file");
-      set((s) => ({ fileCacheVersion: s.fileCacheVersion + 1 }));
+  async retryLoadFile(conversationId, message) {
+    // Clear the cached failure so the load core runs again; keep the in-flight
+    // guard so a double-click doesn't parallelize two downloads.
+    fileLoadErrors.delete(message.id);
+    if (decryptedFileCache.has(message.id) || filesLoading.has(message.id)) return;
+    filesLoading.add(message.id);
+    try {
+      await downloadAndDecryptFile(conversationId, message, get, set);
+    } finally {
+      filesLoading.delete(message.id);
     }
   },
 
@@ -1496,6 +1504,11 @@ export interface DecryptedFile {
 }
 const decryptedFileCache = new Map<string, DecryptedFile>();
 const fileLoadErrors = new Map<string, string>();
+/** Message ids whose file download+decrypt is currently in flight. Guards
+ * `loadFile` against the race where prefetch (on conversation open) and
+ * `FileBubble`'s mount effect both call `loadFile` for the same message before
+ * the first completes — without this, both would download the same file. */
+const filesLoading = new Set<string>();
 
 export function getDecryptedFile(messageId: string): DecryptedFile | null {
   return decryptedFileCache.get(messageId) ?? null;
@@ -1561,5 +1574,84 @@ export function __resetDecryptCaches(): void {
   decryptErrors.clear();
   decryptedFileCache.clear();
   fileLoadErrors.clear();
+  filesLoading.clear();
   senderSigningKeyCache.clear();
+}
+
+/**
+ * Download + decrypt one file/image share's ciphertext and cache the result.
+ * Shared by `loadFile` (first attempt / prefetch) and `retryLoadFile` (manual
+ * retry after a cached failure). The caller owns the in-flight guard
+ * (`filesLoading`) and the cached-error bypass — this just does the work and
+ * writes either `decryptedFileCache` (success) or `fileLoadErrors` (failure),
+ * bumping `fileCacheVersion` so `FileBubble` re-renders.
+ */
+async function downloadAndDecryptFile(
+  conversationId: string,
+  message: MessageResponse,
+  get: () => MessagingState,
+  set: (
+    partial: Partial<MessagingState> | ((s: MessagingState) => Partial<MessagingState>),
+  ) => void,
+): Promise<void> {
+  const identity = get().identity;
+  const conv = get().conversations.find((c) => c.id === conversationId);
+  const fileAttachmentId = message.envelope.file_attachment_id;
+  if (!identity || !conv || typeof fileAttachmentId !== "string") return;
+
+  try {
+    const { ciphertext, envelope, contentType } = await apiDownloadFile(
+      conversationId,
+      fileAttachmentId,
+    );
+    const senderSigningPublicKey = await fetchSenderSigningKey(
+      message.sender_id,
+      message.sender_identity_key_id,
+    );
+
+    let filename: string;
+    let bytes: Uint8Array;
+    if (conv.type === "group") {
+      const epoch = envelope.epoch;
+      if (typeof epoch !== "number") throw new Error("group file missing epoch");
+      const key = groupKeyStore.getKey(conversationId, epoch);
+      if (!key) {
+        throw new Error(`no group key for epoch ${epoch} — you may have joined after this file`);
+      }
+      const nonce = base64ToBytes(String(envelope.nonce));
+      const signature = base64ToBytes(String(envelope.sig));
+      const plaintext = await openGroupMessage(
+        key,
+        ciphertext,
+        nonce,
+        signature,
+        senderSigningPublicKey,
+        conversationId,
+        message.sender_identity_key_id,
+        epoch,
+      );
+      ({ filename, bytes } = unpackFilePlaintext(plaintext));
+    } else {
+      const key = await resolveConversationKey(conversationId, identity);
+      if (!key) throw new Error("no key established for this conversation yet");
+      ({ filename, bytes } = await openFile(
+        key.messageKey,
+        ciphertext,
+        envelope,
+        senderSigningPublicKey,
+        conversationId,
+        message.sender_identity_key_id,
+      ));
+    }
+
+    decryptedFileCache.set(message.id, {
+      filename,
+      blob: new Blob([bytes.slice()], { type: contentType }),
+      contentType,
+    });
+    set((s) => ({ fileCacheVersion: s.fileCacheVersion + 1 }));
+  } catch (err) {
+    fileLoadErrors.set(message.id, err instanceof Error ? err.message : "failed to load file");
+    set((s) => ({ fileCacheVersion: s.fileCacheVersion + 1 }));
+  }
 }

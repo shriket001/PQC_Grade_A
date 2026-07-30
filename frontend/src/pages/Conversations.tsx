@@ -59,6 +59,20 @@ function truncatePreview(text: string, max = 48): string {
   return oneLine.length > max ? `${oneLine.slice(0, max - 1)}…` : oneLine;
 }
 
+/**
+ * Render a participant's display label from the resolved-username map, falling
+ * back to a neutral placeholder when the name isn't known yet. NEVER falls
+ * back to a raw `user_id` prefix — that produced the `e2b0aa5d` truncated-id
+ * flash on refresh (and a permanent fragment when resolution failed). The
+ * server now ships `username` on each participant, so the map is populated
+ * synchronously from the conversation payload; this placeholder only shows
+ * for a participant that somehow arrived without a name and couldn't be
+ * resolved by the store's backstop fetch.
+ */
+function peerLabel(usernameById: Record<string, string>, userId: string): string {
+  return usernameById[userId] ?? "Unknown user";
+}
+
 /** Two-letter avatar glyph for a conversation row: the peer's initials for a
  * direct chat, a hash for a group. Purely cosmetic — the avatar is never a
  * control (the delete/leave action lives in the row's kebab menu, not on the
@@ -105,6 +119,7 @@ export default function Conversations(): JSX.Element {
   const sendOutgoing = useMessagingStore((s) => s.sendOutgoing);
   const sendFile = useMessagingStore((s) => s.sendFile);
   const loadFile = useMessagingStore((s) => s.loadFile);
+  const retryLoadFile = useMessagingStore((s) => s.retryLoadFile);
   const ingestRealtimeMessage = useMessagingStore((s) => s.ingestRealtimeMessage);
   const setRealtimeStatus = useMessagingStore((s) => s.setRealtimeStatus);
   const onGroupMembershipChanged = useMessagingStore((s) => s.onGroupMembershipChanged);
@@ -162,7 +177,7 @@ export default function Conversations(): JSX.Element {
       const label = isGroup
         ? (c.name ?? "Group")
         : peer
-          ? peerUsernameById[peer.user_id] ?? peer.user_id.slice(0, 8)
+          ? peerLabel(peerUsernameById, peer.user_id)
           : "direct";
       return label.toLowerCase().includes(q);
     });
@@ -349,7 +364,7 @@ export default function Conversations(): JSX.Element {
   const activePeerLabel = isActiveGroup
     ? (activeConv?.name ?? "Group")
     : activePeer
-      ? peerUsernameById[activePeer.user_id] ?? activePeer.user_id.slice(0, 8)
+      ? peerLabel(peerUsernameById, activePeer.user_id)
       : null;
   const isActiveGroupAdmin =
     isActiveGroup &&
@@ -446,7 +461,7 @@ export default function Conversations(): JSX.Element {
               const label = isGroup
                 ? (c.name ?? "Group")
                 : peer
-                  ? peerUsernameById[peer.user_id] ?? peer.user_id.slice(0, 8)
+                  ? peerLabel(peerUsernameById, peer.user_id)
                   : "direct";
               const preview = lastMessagePreviewByConversation[c.id] ?? "";
               const time = formatConvTime(c.last_message_at ?? c.created_at);
@@ -621,6 +636,7 @@ export default function Conversations(): JSX.Element {
             onSend={handleSend}
             onAttachFile={handleAttachFile}
             loadFile={loadFile}
+            retryLoadFile={retryLoadFile}
             sending={sending}
             realtimeStatus={realtimeStatus}
             showJoinedNotice={showJoinedNotice}
@@ -778,6 +794,7 @@ interface ActiveThreadProps {
   onSend: (e: React.FormEvent) => void;
   onAttachFile: (e: React.ChangeEvent<HTMLInputElement>) => void;
   loadFile: (conversationId: string, message: MessageResponse) => Promise<void>;
+  retryLoadFile: (conversationId: string, message: MessageResponse) => Promise<void>;
   sending: boolean;
   realtimeStatus: "disconnected" | "connecting" | "open";
   /** FR-028 (UI): show a single "you were added" notice at the top of the
@@ -803,6 +820,7 @@ function ActiveThread(props: ActiveThreadProps): JSX.Element {
     onSend,
     onAttachFile,
     loadFile,
+    retryLoadFile,
     sending,
     realtimeStatus,
     showJoinedNotice,
@@ -892,6 +910,7 @@ function ActiveThread(props: ActiveThreadProps): JSX.Element {
                   conversationId={conversationId}
                   message={m}
                   loadFile={loadFile}
+                  retryLoadFile={retryLoadFile}
                 />
                 <span className="bubble__time mono">{time}</span>
               </div>
@@ -911,7 +930,7 @@ function ActiveThread(props: ActiveThreadProps): JSX.Element {
                   Couldn&apos;t decrypt this message: {err}
                 </span>
               ) : (
-                <span className="bubble__text bubble__text--pending">Decrypting…</span>
+                <span className="bubble__loader" aria-label="Decrypting…" role="status" />
               )}
               <span className="bubble__time mono">{time}</span>
             </div>
@@ -958,12 +977,21 @@ interface FileBubbleProps {
   conversationId: string;
   message: MessageResponse;
   loadFile: (conversationId: string, message: MessageResponse) => Promise<void>;
+  retryLoadFile: (conversationId: string, message: MessageResponse) => Promise<void>;
 }
 
 /** Renders one file/image share (US4): triggers the lazy download+decrypt on
- * mount, then shows an inline image or a filename/download link once
- * `loadFile` populates the in-memory `decryptedFileCache`. */
-function FileBubble({ conversationId, message, loadFile }: FileBubbleProps): JSX.Element {
+ * mount (or picks up the prefetch already started on conversation open), then
+ * shows an inline image or a filename/download link once `loadFile` populates
+ * the in-memory `decryptedFileCache`. While loading it shows a spinner (not
+ * static "Decrypting file…" text); on failure it shows a neutral Retry link
+ * (never the raw error string). */
+function FileBubble({
+  conversationId,
+  message,
+  loadFile,
+  retryLoadFile,
+}: FileBubbleProps): JSX.Element {
   // `loadFile` mutates the module-level decryptedFileCache/fileLoadErrors maps
   // directly (not React state) and signals completion by bumping this store
   // counter — without subscribing to it here, this component has no way to
@@ -998,12 +1026,24 @@ function FileBubble({ conversationId, message, loadFile }: FileBubbleProps): JSX
   }, [file]);
 
   if (error) {
+    // Neutral, non-scary failure state: no raw error string, just a calm label
+    // + a Retry link. Retry clears the cached error and re-runs the load, so a
+    // transient failure (network blip during download/decrypt) recovers.
     return (
-      <span className="bubble__text bubble__text--err">Couldn&apos;t load this file: {error}</span>
+      <span className="bubble__retry">
+        Couldn&apos;t load this file
+        <button
+          type="button"
+          className="bubble__retry-button"
+          onClick={() => void retryLoadFile(conversationId, message)}
+        >
+          Retry
+        </button>
+      </span>
     );
   }
   if (!file || !url) {
-    return <span className="bubble__text bubble__text--pending">Decrypting file…</span>;
+    return <span className="bubble__loader" aria-label="Decrypting file…" role="status" />;
   }
   if (file.contentType.startsWith("image/")) {
     return (
@@ -1039,7 +1079,7 @@ function GroupPanel(props: GroupPanelProps & { selfUserId: string }): JSX.Elemen
       <div className="conv__group-members">
         {participants.map((p) => {
           const isSelf = p.user_id === selfUserId;
-          const label = isSelf ? "you" : peerUsernameById[p.user_id] ?? p.user_id.slice(0, 8);
+          const label = isSelf ? "you" : peerLabel(peerUsernameById, p.user_id);
           // Any member can leave themselves; an admin can also remove others.
           // Both paths go through `removeGroupMember` so a departure always
           // triggers a rekey excluding the departing member (FR-028) — unlike
