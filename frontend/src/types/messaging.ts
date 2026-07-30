@@ -131,6 +131,15 @@ export interface ConversationParticipantResponse {
   user_id: string;
   role: string | null;
   joined_at: string;
+  /**
+   * Public handle + friendly name, joined server-side from the users table so
+   * the UI can render participant labels immediately without a per-peer
+   * `GET /users/{id}` round-trip (which flashed a truncated-id while the
+   * in-memory name map was empty on refresh). Optional: older responses without
+   * them stay valid; the store falls back to per-peer resolution then.
+   */
+  username?: string | null;
+  display_name?: string | null;
 }
 
 export interface ConversationResponse {

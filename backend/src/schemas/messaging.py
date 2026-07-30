@@ -150,6 +150,14 @@ class ConversationParticipantResponse(BaseSchema):
     user_id: UUID
     role: str | None
     joined_at: datetime
+    # Public handle + friendly name, joined from the `users` table so the
+    # client can render participant labels immediately without a per-peer
+    # `GET /users/{id}` round-trip (which left a truncated-id flash on
+    # refresh while the in-memory name map was empty). Optional + nullable:
+    # usernames are already public (`GET /users/{id}`, `/users/search`), and
+    # older callers/responses that don't carry them stay valid.
+    username: str | None = None
+    display_name: str | None = None
 
 
 class ConversationResponse(BaseSchema):

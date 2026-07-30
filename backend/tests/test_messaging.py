@@ -267,6 +267,32 @@ class TestConversations:
             assert listing.status_code == 200
             assert any(c["id"] == body["id"] for c in listing.json())
 
+    async def test_participants_carry_username(self, api_client: TestApp) -> None:
+        """The conversation response includes each participant's public username
+        (joined server-side) so the client renders labels without a per-peer
+        `GET /users/{id}` round-trip — no truncated-id flash on refresh."""
+        alice_id, alice = await _register_login(api_client, email="uname-alice@example.test")
+        bob_id, bob = await _register_login(api_client, email="uname-bob@example.test")
+
+        resp = await api_client.client.post(
+            "/api/v1/conversations",
+            json={"type": "direct", "participant_user_ids": [str(bob_id)]},
+            headers=_headers(alice),
+        )
+        assert resp.status_code == 201, resp.text
+        participants = resp.json()["participants"]
+        by_id = {p["user_id"]: p for p in participants}
+        assert by_id[str(alice_id)]["username"] == username_from_email("uname-alice@example.test")
+        assert by_id[str(bob_id)]["username"] == username_from_email("uname-bob@example.test")
+        # display_name defaults to the username at registration.
+        assert by_id[str(bob_id)]["display_name"] == username_from_email("uname-bob@example.test")
+
+        # The list endpoint carries the same joined names.
+        listing = await api_client.client.get("/api/v1/conversations", headers=_headers(bob))
+        conv = next(c for c in listing.json() if c["id"] == resp.json()["id"])
+        listed = {p["user_id"]: p for p in conv["participants"]}
+        assert listed[str(alice_id)]["username"] == username_from_email("uname-alice@example.test")
+
     async def test_self_conversation_rejected(self, api_client: TestApp) -> None:
         alice_id, alice = await _register_login(api_client, email="self-alice@example.test")
         resp = await api_client.client.post(
